@@ -15,6 +15,7 @@ No HTTP server is exposed — runners dial Core outbound; Core sends frames inwa
 import asyncio
 import concurrent.futures
 import contextlib
+from datetime import datetime, timezone
 import hashlib
 import hmac as hmac_lib
 import importlib.util
@@ -508,9 +509,45 @@ async def _run_async_job(job_id: str, app_name: str, payload: dict) -> None:
             loop.run_in_executor(_process_pool, _execute_app_isolated, app_path, payload),
             timeout=300.0,
         )
+
+        # Strip _actions before storing the job result.
+        actions_to_dispatch = []
+        if isinstance(result, dict) and "_actions" in result:
+            raw = result.pop("_actions")
+            if isinstance(raw, list):
+                actions_to_dispatch = raw
+
         result_json = json.dumps(result) if not isinstance(result, str) else result
         await _update_job(job_id, status="completed", progress=100, result=result_json)
         log.info("Async job %s completed (app: %s)", job_id, app_name)
+
+        # Emit one pg_notify per action so Core's action_listener can dispatch
+        # notifications to subscribed users.
+        if actions_to_dispatch and _db_pool:
+            triggered_at = datetime.now(timezone.utc).isoformat()
+            for act in actions_to_dispatch:
+                if not isinstance(act, dict) or not act.get("name"):
+                    continue
+                try:
+                    evt = json.dumps({
+                        "app_name":     app_name,
+                        "action_name":  act["name"],
+                        "payload":      act.get("payload"),
+                        "job_id":       job_id,
+                        "triggered_at": triggered_at,
+                    })
+                    async with _db_pool.acquire() as conn:
+                        await conn.execute("SELECT pg_notify('app_action_triggered', $1)", evt)
+                    log.info(
+                        "[action] Dispatched async action: app=%s action=%s job=%s",
+                        app_name, act["name"], job_id,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[action] PG notify failed app=%s action=%s: %s",
+                        app_name, act.get("name"), exc,
+                    )
+
     except asyncio.TimeoutError:
         await _update_job(job_id, status="failed", error_message="job timed out after 300 s")
         log.error("Async job %s timed out", job_id)
@@ -612,7 +649,35 @@ async def _handle_req(ws, msg: dict) -> None:
 
             # B10: sync apps → thread pool; async apps → event loop directly.
             result = await _dispatch_execute(module, payload)
+
+            # Strip _actions before serialising the response.
+            actions_to_dispatch = []
+            if isinstance(result, dict) and "_actions" in result:
+                raw = result.pop("_actions")
+                if isinstance(raw, list):
+                    actions_to_dispatch = raw
+
             await _send_res(200, result if isinstance(result, dict) else {"result": result})
+
+            # Send action frames to Core after the response is delivered so the
+            # calling client is unblocked before we fire notifications.
+            for act in actions_to_dispatch:
+                if not isinstance(act, dict) or not act.get("name"):
+                    continue
+                try:
+                    frame = json.dumps({
+                        "type":        "action",
+                        "app_name":    app_name,
+                        "action_name": act["name"],
+                        "payload":     act.get("payload"),
+                    })
+                    await ws.send(frame)
+                    log.debug("[action] Sent action frame: app=%s action=%s", app_name, act["name"])
+                except Exception as exc:
+                    log.debug(
+                        "[action] Frame send failed app=%s action=%s: %s",
+                        app_name, act.get("name"), exc,
+                    )
         except Exception as exc:
             log.exception("Sync execute error: app=%s rid=%s", app_name, rid)
             await _send_res(500, {"error": str(exc)})

@@ -19,15 +19,18 @@ import hashlib
 import hmac as hmac_lib
 import importlib.util
 import inspect
+import io
 import json
 import logging
 import os
 import platform
 import re
+import shutil
 import signal
 import sys
 import threading
 import time
+import zipfile
 
 import asyncpg
 import psycopg2
@@ -75,8 +78,14 @@ _db_pool: asyncpg.Pool | None = None
 
 # ── App Registry ───────────────────────────────────────────────────────────────
 _app_registry: dict = {}
-_registry_lock = threading.Lock()   # sync lock — _load_app runs in thread pool
+_registry_lock = threading.Lock()   # sync lock — held only during writes in _load_app
 _conn_capable:  dict[int, bool] = {}
+
+# ── Sync concurrency control (B9, B12) ────────────────────────────────────────
+# asyncio objects must be created inside main() after the event loop is running.
+_sync_semaphore: asyncio.Semaphore | None = None  # B9: bounds concurrent _handle_req tasks
+_app_load_locks: dict[str, asyncio.Lock] = {}     # B12: per-app load coalescing
+_app_load_locks_mu: asyncio.Lock | None = None    # guards _app_load_locks dict
 
 
 # ── HMAC Tunnel Signature ──────────────────────────────────────────────────────
@@ -123,6 +132,126 @@ def _resolve_app_path(app_name: str) -> str | None:
     return next((p for p in candidates if os.path.isfile(p)), None)
 
 
+# ── ZIP extraction helpers ─────────────────────────────────────────────────────
+_MAX_EXTRACT_FILE_BYTES  = 50 * 1024 * 1024   # 50 MB per-file cap
+_MAX_EXTRACT_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB aggregate cap
+
+
+def _extract_zip_to_apps(app_name: str, zip_bytes: bytes) -> None:
+    """
+    Safely extract a ZIP bundle (raw bytes) into APPS_DIR/{app_name}/.
+
+    Security enforcements applied on every ZIP entry:
+    - Path traversal (zip-slip): normalised member path must stay inside the
+      temporary extraction directory.
+    - Per-file decompression cap (_MAX_EXTRACT_FILE_BYTES): prevents single
+      oversized entries from exhausting disk.
+    - Aggregate decompression cap (_MAX_EXTRACT_TOTAL_BYTES): guards against
+      zip-bomb payloads composed of many individually-small members.
+
+    Uses an atomic rename (tmp → target) so concurrent readers never observe
+    a partially extracted directory.
+    """
+    if err := _validate_app_name(app_name):
+        raise ValueError(err)
+
+    abs_apps_dir = os.path.realpath(APPS_DIR)
+    os.makedirs(abs_apps_dir, exist_ok=True)
+
+    target_dir = os.path.join(abs_apps_dir, app_name)
+    tmp_dir    = os.path.join(abs_apps_dir, f"tmp_{app_name}_{os.getpid()}")
+
+    # Clean up a stale tmp dir from a prior failed run, if any.
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    os.makedirs(tmp_dir, mode=0o755)
+    total_written = 0
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for member in zf.infolist():
+                # Normalise path and strip leading slashes to avoid root escapes.
+                norm = os.path.normpath(member.filename.lstrip("/").lstrip("\\"))
+                # A "../"-only path normalises to ".." — reject it explicitly.
+                if norm.startswith(".."):
+                    raise ValueError(
+                        f"[DEPLOY] Zip-slip detected in member: {member.filename!r}"
+                    )
+                dest = os.path.realpath(os.path.join(tmp_dir, norm))
+                # Double-check: resolved path must stay inside tmp_dir.
+                if not dest.startswith(os.path.realpath(tmp_dir)):
+                    raise ValueError(
+                        f"[DEPLOY] Zip-slip detected in member: {member.filename!r}"
+                    )
+
+                if member.is_dir():
+                    os.makedirs(dest, mode=0o755, exist_ok=True)
+                    continue
+
+                os.makedirs(os.path.dirname(dest), mode=0o755, exist_ok=True)
+                file_written = 0
+                with zf.open(member) as src, open(dest, "wb") as dst:
+                    while True:
+                        chunk = src.read(65536)
+                        if not chunk:
+                            break
+                        file_written  += len(chunk)
+                        total_written += len(chunk)
+                        if file_written > _MAX_EXTRACT_FILE_BYTES:
+                            raise ValueError(
+                                f"[DEPLOY] Member {member.filename!r} exceeds "
+                                f"{_MAX_EXTRACT_FILE_BYTES // (1 << 20)} MB cap"
+                            )
+                        if total_written > _MAX_EXTRACT_TOTAL_BYTES:
+                            raise ValueError(
+                                "[DEPLOY] Bundle exceeds aggregate decompression "
+                                "cap — possible zip bomb"
+                            )
+                        dst.write(chunk)
+
+        # Structural validation: main.py must exist at the bundle root.
+        if not os.path.isfile(os.path.join(tmp_dir, "main.py")):
+            raise ValueError(
+                "[DEPLOY] Invalid bundle: main.py is required at the bundle root"
+            )
+
+        # Atomic promotion: evict stale dir, rename tmp into place.
+        if os.path.exists(target_dir):
+            shutil.rmtree(target_dir)
+        os.rename(tmp_dir, target_dir)
+        log.info("[DEPLOY] Extracted app '%s' → %s", app_name, target_dir)
+
+    except Exception:
+        # Always clean up the temp directory on failure.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+
+def _fetch_app_bytes_sync(app_name: str) -> bytes | None:
+    """
+    Synchronous helper: fetch code_bytes for a single app from PostgreSQL.
+    Used during startup preload before the asyncpg pool is initialised.
+    Returns raw ZIP bytes, or None when the app is not found in the DB.
+    """
+    if not DATABASE_URL:
+        return None
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT code_bytes FROM noderouter_core.apps WHERE app_name = %s",
+                    (app_name,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return bytes(row[0])
+    except Exception as exc:
+        log.warning("[DEPLOY] DB fetch failed for '%s': %s", app_name, exc)
+        return None
+
+
 def _load_app(app_name: str):
     """
     Dynamically load an app module from disk and atomically update the registry.
@@ -157,15 +286,63 @@ def _load_app(app_name: str):
 
 
 def _get_app(app_name: str):
-    """Return a cached app module, or None if not yet loaded."""
-    with _registry_lock:
-        return _app_registry.get(app_name)
+    """Return a cached app module, or None if not yet loaded.
+
+    B8 — Lock-free read: CPython's GIL guarantees that dict.get() is atomic,
+    so no additional lock is needed for reads. _registry_lock is held only
+    during writes inside _load_app, keeping the hot-path (cache-hit) free of
+    any synchronisation overhead.
+    """
+    return _app_registry.get(app_name)
 
 
 def _preload_apps() -> None:
-    """Warm the registry at startup by loading every app found on disk."""
+    """
+    Warm the app registry at startup.
+
+    Primary path (DATABASE_URL set): query noderouter_core.apps, fetch each
+    app's code_bytes blob, extract into APPS_DIR, and load the Python module.
+    This makes PostgreSQL the Single Source of Truth — no shared filesystem
+    mount between Core and Runner nodes is required.
+
+    Fallback path (DATABASE_URL absent or query fails): scan APPS_DIR on disk
+    and load whatever Python modules are already present (legacy behaviour).
+    """
     os.makedirs(APPS_DIR, exist_ok=True)
     loaded = 0
+
+    if DATABASE_URL:
+        try:
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT app_name, code_bytes FROM noderouter_core.apps"
+                    )
+                    rows = cur.fetchall()
+
+            log.info("[DEPLOY] Preloading %d app(s) from PostgreSQL blob store", len(rows))
+            for app_name, code_bytes_raw in rows:
+                if err := _validate_app_name(app_name):
+                    log.warning("[DEPLOY] Preload skipped DB app '%s': %s", app_name, err)
+                    continue
+                try:
+                    _extract_zip_to_apps(app_name, bytes(code_bytes_raw))
+                    _, load_err = _load_app(app_name)
+                    if load_err:
+                        log.warning("[DEPLOY] Preload load error '%s': %s", app_name, load_err)
+                    else:
+                        loaded += 1
+                except Exception as exc:
+                    log.warning("[DEPLOY] Preload extraction error '%s': %s", app_name, exc)
+
+            log.info("App preload from PostgreSQL complete: %d app(s) ready", loaded)
+            return
+        except Exception as exc:
+            log.warning(
+                "[DEPLOY] PostgreSQL preload failed (%s) — falling back to disk scan", exc
+            )
+
+    # Fallback: scan APPS_DIR on disk (no DATABASE_URL or DB unreachable).
     for entry in sorted(os.scandir(APPS_DIR), key=lambda e: e.name):
         app_name = None
         if entry.is_dir() and os.path.isfile(os.path.join(entry.path, "main.py")):
@@ -178,7 +355,7 @@ def _preload_apps() -> None:
                 log.warning("Preload skipped — %s", err)
             else:
                 loaded += 1
-    log.info("App preload complete: %d app(s) ready", loaded)
+    log.info("App preload from disk complete: %d app(s) ready", loaded)
 
 
 # ── Isolated subprocess entry point ───────────────────────────────────────────
@@ -342,47 +519,103 @@ async def _run_async_job(job_id: str, app_name: str, payload: dict) -> None:
         log.exception("Async job %s raised an unhandled error", job_id)
 
 
+# ── B10: Async-capable dispatch ───────────────────────────────────────────────
+async def _dispatch_execute(module, payload: dict):
+    """
+    Dispatch module.execute(payload) via the appropriate execution path.
+
+    B10 — Thread hand-off elimination for async apps:
+      sync  execute(data)       → loop.run_in_executor (thread pool, GIL-safe)
+      async execute(data) (coro)→ awaited directly in the event loop (zero
+                                  thread context-switch overhead, ~50–200 µs
+                                  saved per call for fast non-blocking apps)
+
+    Apps opt in to the async path by declaring `async def execute(data: dict)`.
+    Sync apps continue to run in the ThreadPoolExecutor as before.
+    """
+    fn = getattr(module, "execute")
+    if asyncio.iscoroutinefunction(fn):
+        return await fn(payload)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_thread_pool, fn, payload)
+
+
 # ── Sync request handler (tunnel req frame) ────────────────────────────────────
 async def _handle_req(ws, msg: dict) -> None:
     """
     Handle a single synchronous req frame received from Core over the tunnel.
-    Executes module.execute(payload) in the thread pool and sends a res frame back.
+
+    Performance improvements applied:
+      B8  Lock-free _get_app() read — GIL makes dict.get() atomic; no lock needed.
+      B9  _sync_semaphore bounds concurrent task count to SYNC_MAX_WORKERS × 4,
+          preventing unbounded asyncio task accumulation under traffic bursts.
+      B10 _dispatch_execute() runs async apps directly in the event loop,
+          eliminating the ~50–200 µs thread context-switch for fast apps.
+      B11 _send_res() catches serialization errors and returns a 500 frame so
+          the Core goroutine is never silently abandoned (which would timeout).
+      B12 Per-app asyncio.Lock coalesces concurrent cache-miss loads so the
+          same module is never imported in parallel by multiple coroutines.
     """
     rid      = msg.get("rid", "")
     app_name = msg.get("app", "")
     payload  = msg.get("payload") or {}
 
+    # B11: catch serialization failures so Core's goroutine always gets a frame
+    # back; previously a non-serializable result silently caused a 30 s timeout.
     async def _send_res(status: int, body: dict) -> None:
-        frame = json.dumps({"type": "res", "rid": rid, "status": status, "body": body})
+        try:
+            frame = json.dumps({"type": "res", "rid": rid, "status": status, "body": body})
+        except (TypeError, ValueError) as exc:
+            log.error("Sync res serialization error rid=%s: %s", rid, exc)
+            frame = json.dumps({
+                "type": "res", "rid": rid, "status": 500,
+                "body": {"error": "response serialization failed"},
+            })
         try:
             await ws.send(frame)
-        except Exception:
-            pass  # tunnel may have closed between receive and send
+        except Exception as exc:
+            log.debug("Tunnel send failed rid=%s: %s", rid, exc)
 
-    if err := _validate_app_name(app_name):
-        await _send_res(400, {"error": err})
-        return
-
-    module = _get_app(app_name)
-    if module is None:
-        module, err = await asyncio.to_thread(_load_app, app_name)
-        if err:
-            await _send_res(404, {"error": err})
+    # B9: acquire semaphore BEFORE processing to bound the number of in-flight
+    # tasks.  Allows SYNC_MAX_WORKERS × 4 concurrent handlers; excess tasks wait
+    # here rather than spawning unboundedly and exhausting system resources.
+    async with _sync_semaphore:
+        if err := _validate_app_name(app_name):
+            await _send_res(400, {"error": err})
             return
 
-    try:
-        if isinstance(payload, (str, bytes)):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = {}
+        # B8: lock-free registry read (GIL-safe).
+        module = _get_app(app_name)
+        if module is None:
+            # B12: coalesce concurrent misses for the same app_name.
+            # Only the first coroutine through the app_lock calls _load_app;
+            # others wait, then re-check the registry before re-loading.
+            async with _app_load_locks_mu:
+                if app_name not in _app_load_locks:
+                    _app_load_locks[app_name] = asyncio.Lock()
+                app_lock = _app_load_locks[app_name]
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(_thread_pool, module.execute, payload)
-        await _send_res(200, result if isinstance(result, dict) else {"result": result})
-    except Exception as exc:
-        log.exception("Sync execute error: app=%s rid=%s", app_name, rid)
-        await _send_res(500, {"error": str(exc)})
+            async with app_lock:
+                module = _get_app(app_name)  # re-check: another coroutine may have loaded it
+                if module is None:
+                    module, load_err = await asyncio.to_thread(_load_app, app_name)
+                    if load_err:
+                        await _send_res(404, {"error": load_err})
+                        return
+
+        try:
+            if isinstance(payload, (str, bytes)):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+
+            # B10: sync apps → thread pool; async apps → event loop directly.
+            result = await _dispatch_execute(module, payload)
+            await _send_res(200, result if isinstance(result, dict) else {"result": result})
+        except Exception as exc:
+            log.exception("Sync execute error: app=%s rid=%s", app_name, rid)
+            await _send_res(500, {"error": str(exc)})
 
 
 # ── WebSocket Tunnel Loop ──────────────────────────────────────────────────────
@@ -437,6 +670,62 @@ async def _tunnel_loop() -> None:
                 pass
 
 
+# ── App pull & hot-reload coroutine ───────────────────────────────────────────
+async def _pull_and_reload_app(app_name: str) -> None:
+    """
+    Fetch the latest code_bytes blob for `app_name` from noderouter_core.apps,
+    extract the ZIP into APPS_DIR/{app_name}/, and hot-reload the Python module
+    so in-flight sync requests immediately use the updated code.
+
+    Called as an asyncio.Task from the _on_app_updated NOTIFY callback.
+    All blocking I/O (DB fetch, ZIP extraction) runs in the thread pool.
+    """
+    try:
+        # Fetch raw ZIP bytes from PostgreSQL using the asyncpg connection pool.
+        if _db_pool is None:
+            log.warning(
+                "[DEPLOY] app_updated: DB pool not ready — cannot pull '%s'", app_name
+            )
+            return
+
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT code_bytes FROM noderouter_core.apps WHERE app_name = $1",
+                app_name,
+            )
+
+        if row is None:
+            log.warning("[DEPLOY] app_updated: '%s' not found in DB", app_name)
+            return
+
+        zip_bytes = bytes(row["code_bytes"])
+        log.info(
+            "[DEPLOY] app_updated: fetched %d bytes for '%s' — extracting",
+            len(zip_bytes), app_name,
+        )
+
+        # Extraction is CPU/IO-bound; offload to the thread pool.
+        await asyncio.to_thread(_extract_zip_to_apps, app_name, zip_bytes)
+
+        # Hot-reload the Python module into the in-memory registry.
+        _, load_err = await asyncio.to_thread(_load_app, app_name)
+        if load_err:
+            log.warning(
+                "[DEPLOY] app_updated: load error for '%s': %s", app_name, load_err
+            )
+        else:
+            log.info(
+                "[DEPLOY] Extraction completed locally, broadcasting 'app_updated' "
+                "notification — app=%s hot-reloaded successfully", app_name,
+            )
+
+    except Exception as exc:
+        log.exception(
+            "[DEPLOY] app_updated: unhandled error pulling/reloading '%s': %s",
+            app_name, exc,
+        )
+
+
 # ── PostgreSQL LISTEN Daemon (asyncpg) ─────────────────────────────────────────
 async def _async_listener_loop() -> None:
     """
@@ -465,9 +754,13 @@ async def _async_listener_loop() -> None:
 
     async def _on_app_updated(conn, pid, channel, payload):
         name = (payload or "").strip()
-        if name:
-            log.info("NOTIFY app_updated: hot-reloading '%s'", name)
-            asyncio.create_task(asyncio.to_thread(_load_app, name))
+        if not name:
+            return
+        if err := _validate_app_name(name):
+            log.warning("[DEPLOY] app_updated ignored for '%s': %s", name, err)
+            return
+        log.info("[DEPLOY] NOTIFY app_updated: pulling '%s' from PostgreSQL blob store", name)
+        asyncio.create_task(_pull_and_reload_app(name))
 
     while not _shutdown_event.is_set():
         conn = None
@@ -497,8 +790,17 @@ async def _async_listener_loop() -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 async def main() -> None:
-    global _shutdown_event, _db_pool
+    global _shutdown_event, _db_pool, _sync_semaphore, _app_load_locks_mu
     _shutdown_event = asyncio.Event()
+
+    # B9: initialise semaphore now that the event loop is running.
+    # Capacity = SYNC_MAX_WORKERS × 4 → queue depth of 4× the thread pool size
+    # before backpressure kicks in. Tasks that exceed this wait here rather than
+    # spawning without bound and exhausting asyncio / OS resources.
+    _sync_semaphore = asyncio.Semaphore(SYNC_MAX_WORKERS * 4)
+
+    # B12: asyncio.Lock objects must be created inside the running event loop.
+    _app_load_locks_mu = asyncio.Lock()
 
     loop = asyncio.get_running_loop()
     if not _IS_WINDOWS:

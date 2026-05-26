@@ -133,6 +133,112 @@ def _resolve_app_path(app_name: str) -> str | None:
     return next((p for p in candidates if os.path.isfile(p)), None)
 
 
+# ── Node ID resolution ─────────────────────────────────────────────────────────
+_NODE_ID_FILE = os.path.join(APPS_DIR, ".node_id")
+
+
+def _derive_core_http_url() -> str:
+    """Convert the WS/WSS URL to HTTP/HTTPS for REST calls."""
+    url = CORE_WS_URL
+    if url.startswith("wss://"):
+        return "https://" + url[6:]
+    if url.startswith("ws://"):
+        return "http://" + url[5:]
+    return url
+
+
+def _resolve_node_id() -> str:
+    """
+    Resolve NODE_ID through three layers (highest priority first):
+
+    1. NODE_ID env var — set by the operator, takes unconditional precedence.
+    2. Persisted file  — written on first successful auto-registration.
+       Location: APPS_DIR/.node_id  (inside the shared apps volume, so it
+       survives Docker container re-creates and process restarts alike).
+    3. Auto-register   — POST /api/nodes/auto-register with HMAC body auth.
+       Hostname is used as the node name (idempotent: same hostname → same id).
+       Location type is detected automatically:
+         • docker_internal  — /.dockerenv present (standard Docker marker)
+         • localhost        — bare-metal / VM
+
+    Updates the module-level NODE_ID global and returns it.
+    Returns empty string if all three layers fail (tunnel loop will retry).
+    """
+    global NODE_ID
+
+    # 1. Env var set by operator
+    if NODE_ID:
+        return NODE_ID
+
+    # 2. Persisted file
+    node_id_file = os.path.join(APPS_DIR, ".node_id")
+    if os.path.isfile(node_id_file):
+        try:
+            val = open(node_id_file).read().strip()  # noqa: WPS515
+            if val:
+                NODE_ID = val
+                log.info("[node-id] Loaded from %s: %s", node_id_file, NODE_ID)
+                return NODE_ID
+        except OSError as exc:
+            log.warning("[node-id] Could not read %s: %s", node_id_file, exc)
+
+    # 3. Auto-register via Core REST API
+    import socket
+    import urllib.error
+    import urllib.request
+
+    hostname    = os.getenv("HOSTNAME", socket.gethostname())
+    location    = "docker_internal" if os.path.exists("/.dockerenv") else "localhost"
+    body        = json.dumps({"name": hostname, "location_type": location}).encode()
+    base_url    = _derive_core_http_url()
+    endpoint    = f"{base_url}/api/nodes/auto-register"
+
+    for attempt in range(5):
+        if attempt:
+            delay = 2 * attempt
+            log.info("[node-id] Retrying auto-register in %ds (attempt %d/5) …", delay, attempt + 1)
+            time.sleep(delay)
+
+        # Refresh HMAC timestamp on every attempt to stay within the 30 s replay window.
+        ts          = str(int(time.time()))
+        body_hash   = hashlib.sha256(body).hexdigest()
+        message     = f"{ts}\n{body_hash}".encode()
+        sig         = "sha256=" + hmac_lib.new(
+            RUNNER_SECRET.encode(), message, hashlib.sha256,
+        ).hexdigest()
+
+        req = urllib.request.Request(
+            endpoint,
+            data=body,
+            headers={
+                "Content-Type":      "application/json",
+                "X-Noderouter-Ts":   ts,
+                "X-Noderouter-Sig":  sig,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data    = json.loads(resp.read())
+                NODE_ID = data["node_id"]
+                os.makedirs(APPS_DIR, exist_ok=True)
+                with open(node_id_file, "w") as fh:
+                    fh.write(NODE_ID)
+                log.info(
+                    "[node-id] Auto-registered: id=%s name=%s location=%s",
+                    NODE_ID, hostname, location,
+                )
+                return NODE_ID
+        except Exception as exc:
+            log.warning("[node-id] Auto-register attempt %d/5 failed: %s", attempt + 1, exc)
+
+    log.error(
+        "[node-id] Auto-registration failed after 5 attempts — "
+        "tunnel will connect without NODE_ID (async job routing disabled)"
+    )
+    return ""
+
+
 # ── ZIP extraction helpers ─────────────────────────────────────────────────────
 _MAX_EXTRACT_FILE_BYTES  = 50 * 1024 * 1024   # 50 MB per-file cap
 _MAX_EXTRACT_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB aggregate cap
@@ -876,17 +982,21 @@ async def main() -> None:
     log.info("=" * 60)
     log.info("Noderouter Python Runner — Tunnel Architecture")
     log.info("  Core WS URL  : %s", CORE_WS_URL)
-    log.info("  Node ID      : %s", NODE_ID or "(not set)")
+    log.info("  Node ID      : %s", NODE_ID or "(resolving…)")
     log.info("  Apps         : %s", APPS_DIR)
     log.info("  Async Chan   : %s", "enabled" if DATABASE_URL else "disabled (DATABASE_URL not set)")
     log.info("  Async Workers: %d", ASYNC_MAX_WORKERS)
     log.info("  Sync Workers : %d", SYNC_MAX_WORKERS)
     log.info("=" * 60)
 
+    # Resolve NODE_ID: env var → persisted file → auto-register with Core.
+    # Must run after app preload so APPS_DIR exists for the .node_id file.
+    await asyncio.to_thread(_resolve_node_id)
+    if NODE_ID:
+        log.info("  Node ID      : %s (resolved)", NODE_ID)
+
     # Preload apps synchronously before accepting any tunnel requests.
     await asyncio.to_thread(_preload_apps)
-
-    if DATABASE_URL:
         _db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=2,
@@ -914,8 +1024,6 @@ async def main() -> None:
 if __name__ == "__main__":
     if not RUNNER_SECRET:
         log.warning("RUNNER_SECRET is not set — HMAC auth disabled (dev mode only)")
-    if not NODE_ID:
-        log.warning("NODE_ID is not set — runner will be rejected by Core (set NODE_ID)")
 
     # Initialise executor pools before asyncio.run() to avoid Windows spawn recursion:
     # ProcessPoolExecutor uses 'spawn' on Windows, which re-imports this module in

@@ -134,7 +134,18 @@ def _resolve_app_path(app_name: str) -> str | None:
 
 
 # ── Node ID resolution ─────────────────────────────────────────────────────────
-_NODE_ID_FILE = os.path.join(APPS_DIR, ".node_id")
+def _node_id_file() -> str:
+    """
+    Return the per-hostname .node_id file path inside APPS_DIR.
+
+    Keyed by hostname so multiple runners sharing the same APPS_DIR volume
+    (e.g. two containers on the same Docker host) each persist their own
+    node_id without overwriting each other's file.
+    """
+    import socket
+    hostname = os.getenv("HOSTNAME", socket.gethostname())
+    safe     = re.sub(r"[^a-zA-Z0-9_-]", "_", hostname)[:64]
+    return os.path.join(APPS_DIR, f".node_id_{safe}")
 
 
 def _derive_core_http_url() -> str:
@@ -170,8 +181,8 @@ def _resolve_node_id() -> str:
     if NODE_ID:
         return NODE_ID
 
-    # 2. Persisted file
-    node_id_file = os.path.join(APPS_DIR, ".node_id")
+    # 2. Persisted file (per-hostname — safe when APPS_DIR is a shared volume)
+    node_id_file = _node_id_file()
     if os.path.isfile(node_id_file):
         try:
             val = open(node_id_file).read().strip()  # noqa: WPS515

@@ -148,6 +148,78 @@ def _node_id_file() -> str:
     return os.path.join(APPS_DIR, f".node_id_{safe}")
 
 
+def _clear_persisted_node_id() -> None:
+    """
+    Reset the module-level NODE_ID and delete the persisted .node_id file.
+
+    Called by _tunnel_loop when Core returns 401/403 — indicates the node
+    record was removed or the DB was wiped. Clearing the file forces the
+    next _resolve_node_id() call to auto-register fresh rather than replaying
+    a UUID that no longer exists in Core's database.
+    """
+    global NODE_ID
+    NODE_ID = ""
+    node_id_file = _node_id_file()
+    try:
+        os.remove(node_id_file)
+        log.info("[node-id] Cleared persisted node_id file: %s", node_id_file)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("[node-id] Could not remove node_id file %s: %s", node_id_file, exc)
+
+
+def _detect_location() -> str:
+    """
+    Auto-detect the deployment environment and return the matching location_type.
+
+    Returns one of two values:
+      "docker_internal" — runner is inside a Docker container on the same host
+                          as Core (/.dockerenv marker is present).
+      "cloud"           — any other deployment: remote Docker on a cloud VM,
+                          AWS ECS/EC2, GCP Cloud Run, Azure Container, Kubernetes,
+                          or any bare-metal remote machine.
+
+    Runners in this architecture are always containerised. The fallback for any
+    non-Docker environment is "cloud" (not "localhost"). Override by setting the
+    NODE_LOCATION env var to any valid location_type.
+
+    The AWS IMDSv1 probe hits 169.254.169.254 (link-local, LAN-only) with a
+    300 ms timeout — no packets leave the private network.
+    """
+    import urllib.request as _req
+
+    # Operator override always wins.
+    if override := os.getenv("NODE_LOCATION"):
+        return override
+
+    # Docker: standard marker created by the Docker daemon at container start.
+    if os.path.exists("/.dockerenv"):
+        return "docker_internal"
+
+    # AWS EC2 / ECS — IMDSv1 link-local probe (LAN-only, no external traffic).
+    try:
+        _req.urlopen("http://169.254.169.254/latest/meta-data/instance-id", timeout=0.3)
+        return "cloud"
+    except Exception:
+        pass
+
+    # Azure — standard env vars set by App Service and Container Instances.
+    if os.getenv("WEBSITE_INSTANCE_ID") or os.getenv("AZURE_REGION"):
+        return "cloud"
+
+    # GCP Cloud Run / Compute Engine.
+    if os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("K_SERVICE"):
+        return "cloud"
+
+    # Generic Kubernetes (covers EKS, GKE, AKS, and bare-metal k8s).
+    if os.getenv("KUBERNETES_SERVICE_HOST"):
+        return "cloud"
+
+    # Default: any non-Docker runner is a remote/cloud deployment.
+    return "cloud"
+
+
 def _derive_core_http_url() -> str:
     """Convert the WS/WSS URL to HTTP/HTTPS for REST calls."""
     url = CORE_WS_URL
@@ -199,10 +271,14 @@ def _resolve_node_id() -> str:
     import urllib.request
 
     hostname    = os.getenv("HOSTNAME", socket.gethostname())
-    location    = "docker_internal" if os.path.exists("/.dockerenv") else "localhost"
-    # runner_url is a stable label for this runner instance — used by Core to
-    # detect and delete ghost nodes that registered under a previous random hostname.
-    runner_url  = CORE_WS_URL
+    location    = _detect_location()
+    # runner_url is a stable per-machine identity used by Core to detect and
+    # delete ghost nodes left behind after Docker container recreates (where
+    # the hostname changes but the physical host is the same).
+    # MUST be "runner://<hostname>" — unique per machine/container — NOT
+    # CORE_WS_URL, which is identical across all runners and would cause Core's
+    # ghost-cleanup query to delete sibling runner nodes by mistake.
+    runner_url  = f"runner://{hostname}"
     body        = json.dumps({"name": hostname, "location_type": location, "runner_url": runner_url}).encode()
     base_url    = _derive_core_http_url()
     endpoint    = f"{base_url}/api/nodes/auto-register"
@@ -846,6 +922,37 @@ async def _tunnel_loop() -> None:
         except asyncio.CancelledError:
             return
         except Exception as exc:
+            # ── 401 / 403: Core rejected our node_id ─────────────────────────
+            # This happens when the node record was deleted from Core's DB
+            # (admin removal, DB wipe, disaster recovery). Clear the persisted
+            # node_id and re-register so we get a fresh UUID.
+            status_code = getattr(exc, "status_code", None)
+            if status_code in (401, 403):
+                log.warning(
+                    "[tunnel] Core rejected node_id=%s (HTTP %d) — "
+                    "clearing cached id and re-registering",
+                    NODE_ID, status_code,
+                )
+                _clear_persisted_node_id()
+                await asyncio.to_thread(_resolve_node_id)
+                if NODE_ID:
+                    log.info("[tunnel] Re-registered as node_id=%s — reconnecting now", NODE_ID)
+                    attempt = 0  # reset backoff after successful re-registration
+                else:
+                    # Auto-registration failed (Core unreachable, bad secret, etc.).
+                    # Back off before retrying so we don't hammer Core.
+                    delay = _backoff(attempt)
+                    log.error(
+                        "[tunnel] Re-registration failed — backing off %.1fs", delay
+                    )
+                    attempt += 1
+                    try:
+                        await asyncio.wait_for(_shutdown_event.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
+                continue
+
+            # ── All other errors: network drop, timeout, etc. ─────────────────
             delay = _backoff(attempt)
             log.error("[tunnel] Error: %s — reconnecting in %.1fs", exc, delay)
             attempt += 1

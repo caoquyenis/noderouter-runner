@@ -997,6 +997,8 @@ async def main() -> None:
 
     # Preload apps synchronously before accepting any tunnel requests.
     await asyncio.to_thread(_preload_apps)
+
+    if DATABASE_URL:
         _db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=2,

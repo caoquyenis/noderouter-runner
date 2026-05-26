@@ -200,7 +200,10 @@ def _resolve_node_id() -> str:
 
     hostname    = os.getenv("HOSTNAME", socket.gethostname())
     location    = "docker_internal" if os.path.exists("/.dockerenv") else "localhost"
-    body        = json.dumps({"name": hostname, "location_type": location}).encode()
+    # runner_url is a stable label for this runner instance — used by Core to
+    # detect and delete ghost nodes that registered under a previous random hostname.
+    runner_url  = CORE_WS_URL
+    body        = json.dumps({"name": hostname, "location_type": location, "runner_url": runner_url}).encode()
     base_url    = _derive_core_http_url()
     endpoint    = f"{base_url}/api/nodes/auto-register"
 

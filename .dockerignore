@@ -1,0 +1,25 @@
+# Runtime / secrets — never bake into the image
+.env
+.env.local
+.env.*.local
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# App packages — mounted as a shared volume at runtime
+apps/
+
+# VCS & editor
+.git
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+
+# Docs
+README.md
+*.md
